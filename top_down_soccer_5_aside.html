@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Top-Down 2D Futsal — 5-a-side</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b6b3a;font-family:Inter,system-ui,Segoe UI,Roboto,'Helvetica Neue',Arial}
+  #ui{position:fixed;left:12px;top:12px;color:#fff;z-index:20}
+  #canvas{display:block;margin:0 auto;background:linear-gradient(#0ea86e,#0b6b3a);box-shadow:0 10px 30px rgba(0,0,0,.5);border-radius:8px}
+  .panel{background:rgba(0,0,0,.35);padding:8px;border-radius:6px;margin-bottom:8px}
+  a{color:#ffd;}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="panel">
+    <div style="font-weight:700">Top-down 2D Futsal — 5-a-side</div>
+    <div style="font-size:13px;margin-top:6px">Controls: WASD = move (you control 1 player).<br>Space = kick (pass / shoot). Mouse = aim kick. R = restart. P = pause.</div>
+  </div>
+  <div id="score" class="panel">Home 0 — 0 Away</div>
+</div>
+<canvas id="canvas" width="980" height="640"></canvas>
+<script>
+/*
+Standalone single-file top-down futsal-style soccer (5-a-side).
+Player: WASD
+Space: kick toward mouse (if ball within control distance) otherwise nudge
+Simple physics: velocities, friction, collisions
+AI: very simple steering, passes, and shooting
+*/
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// Field geometry (approximate futsal proportions)
+const FIELD = {x:40,y:40,w:W-80,h:H-80};
+const GOAL_WIDTH = 140; // futsal-like small goals
+const GOAL_DEPTH = 12;
+
+// Game objects
+const TEAM_SIZE = 5; // includes goalkeeper
+const PLAYERS = [];
+const BALL = {x: W/2, y: H/2, r: 8, vx:0, vy:0}; // ball slightly smaller than players
+const PLAYER_RADIUS = 12; // players slightly bigger than ball
+
+let score = {home:0, away:0};
+let lastTouch = null; // {team: 'home'/'away', idx}
+let paused = false;
+let showDebug = false;
+
+// Utility
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function rand(min,max){return min + Math.random()*(max-min);} 
+function dist(a,b){const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy);} 
+
+// Teams: home (left) and away (right). Home is user side by default.
+class Player {
+  constructor(team, idx, x,y, controlled=false){
+    this.team = team; this.idx = idx; this.x = x; this.y = y; this.vx=0; this.vy=0; this.r=PLAYER_RADIUS; this.ctrl = controlled; this.speed=1.8; this.hasBall=false; this.kickCooldown=0; this.role = idx===0? 'GK' : (idx<=2? 'DEF' : 'ATT');
+  }
+  update(dt){
+    // speed cap
+    const sp = this.speed;
+    // friction
+    this.vx *= 0.96; this.vy *= 0.96;
+    // movement applied by input or AI
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    // keep inside field boundaries
+    const minX = FIELD.x + this.r; const maxX = FIELD.x+FIELD.w - this.r;
+    const minY = FIELD.y + this.r; const maxY = FIELD.y+FIELD.h - this.r;
+    this.x = clamp(this.x,minX,maxX);
+    this.y = clamp(this.y,minY,maxY);
+    if(this.kickCooldown>0) this.kickCooldown = Math.max(0,this.kickCooldown-dt);
+  }
+}
+
+// create players placement
+function setupPlayers(){
+  PLAYERS.length = 0;
+  // home left side
+  for(let i=0;i<TEAM_SIZE;i++){
+    const x = FIELD.x + FIELD.w*0.18 + i*6; // spread
+    const y = FIELD.y + FIELD.h*(0.2 + i/(TEAM_SIZE-1)*0.6);
+    PLAYERS.push(new Player('home', i, x+rand(-10,10), y+rand(-10,10), i===2)); // user controls idx 2 (center)
+  }
+  // away right side
+  for(let i=0;i<TEAM_SIZE;i++){
+    const x = FIELD.x + FIELD.w*0.82 + i*6;
+    const y = FIELD.y + FIELD.h*(0.2 + i/(TEAM_SIZE-1)*0.6);
+    PLAYERS.push(new Player('away', i, x+rand(-10,10), y+rand(-10,10), false));
+  }
+}
+
+setupPlayers();
+
+// Input handling
+const input = {up:false,down:false,left:false,right:false,space:false,mouseX:W/2,mouseY:H/2};
+window.addEventListener('keydown', e=>{
+  const k=e.key.toLowerCase();
+  if(k==='w') input.up=true;
+  if(k==='s') input.down=true;
+  if(k==='a') input.left=true;
+  if(k==='d') input.right=true;
+  if(k===' ') { input.space=true; e.preventDefault(); }
+  if(k==='r'){resetPositions();}
+  if(k==='p'){ paused = !paused; }
+  if(k==='`'){ showDebug = !showDebug; }
+});
+window.addEventListener('keyup', e=>{
+  const k=e.key.toLowerCase();
+  if(k==='w') input.up=false;
+  if(k==='s') input.down=false;
+  if(k==='a') input.left=false;
+  if(k==='d') input.right=false;
+  if(k===' ') { input.space=false; }
+});
+canvas.addEventListener('mousemove', e=>{
+  const rect = canvas.getBoundingClientRect();
+  input.mouseX = (e.clientX-rect.left) * (canvas.width/rect.width);
+  input.mouseY = (e.clientY-rect.top) * (canvas.height/rect.height);
+});
+
+function findPlayerControlled(){
+  return PLAYERS.find(p => p.ctrl);
+}
+
+// physics
+function stepPhysics(dt){
+  // players' control / AI
+  for(const p of PLAYERS){
+    if(p.ctrl){
+      // user-controlled movement
+      let ax = 0, ay = 0;
+      if(input.up) ay -= p.speed;
+      if(input.down) ay += p.speed;
+      if(input.left) ax -= p.speed;
+      if(input.right) ax += p.speed;
+      // normalize so diagonal not too fast
+      if(ax!==0 || ay!==0){
+        const m = Math.hypot(ax,ay) || 1; ax = ax/m*p.speed; ay = ay/m*p.speed;
+        p.vx += ax*dt*6; p.vy += ay*dt*6;
+      }
+      // kick handling
+      if(input.space) handleKick(p);
+    } else {
+      // simple AI
+      aiUpdate(p, dt);
+    }
+  }
+
+  // ball movement
+  BALL.x += BALL.vx*dt; BALL.y += BALL.vy*dt;
+  // ball friction
+  BALL.vx *= 0.995; BALL.vy *= 0.995;
+  // collisions between players and ball
+  for(const p of PLAYERS){
+    const dx = BALL.x - p.x; const dy = BALL.y - p.y; const d = Math.hypot(dx,dy);
+    const minD = BALL.r + p.r;
+    if(d < minD){
+      // simple elastic push: move ball away and add velocity
+      const nx = dx/d, ny = dy/d;
+      const overlap = minD - d+0.2;
+      BALL.x += nx*overlap; BALL.y += ny*overlap;
+      // ball picks up player's movement
+      BALL.vx = (BALL.vx*0.3) + (p.vx*0.9 + nx*3);
+      BALL.vy = (BALL.vy*0.3) + (p.vy*0.9 + ny*3);
+      lastTouch = {team: p.team, idx: p.idx};
+    }
+  }
+
+  // collisions between players (avoid overlap)
+  for(let i=0;i<PLAYERS.length;i++){
+    for(let j=i+1;j<PLAYERS.length;j++){
+      const a=PLAYERS[i], b=PLAYERS[j];
+      const dx=b.x-a.x, dy=b.y-a.y; const d=Math.hypot(dx,dy);
+      const minD = a.r + b.r;
+      if(d<minD && d>0.001){
+        const nx=dx/d, ny=dy/d; const overlap = 0.5*(minD-d+0.1);
+        b.x += nx*overlap; b.y += ny*overlap; a.x -= nx*overlap; a.y -= ny*overlap;
+        // swap some velocity
+        const vx = (b.vx - a.vx)*0.3; const vy=(b.vy - a.vy)*0.3;
+        b.vx -= vx; b.vy -= vy; a.vx += vx; a.vy += vy;
+      }
+    }
+  }
+
+  // ball bounce off walls (field boundaries)
+  const left = FIELD.x + BALL.r, right = FIELD.x+FIELD.w - BALL.r;
+  const top = FIELD.y + BALL.r, bottom = FIELD.y+FIELD.h - BALL.r;
+  if(BALL.x < left){ BALL.x = left; BALL.vx = -BALL.vx*0.7; }
+  if(BALL.x > right){ BALL.x = right; BALL.vx = -BALL.vx*0.7; }
+  if(BALL.y < top){ BALL.y = top; BALL.vy = -BALL.vy*0.7; }
+  if(BALL.y > bottom){ BALL.y = bottom; BALL.vy = -BALL.vy*0.7; }
+
+  // goal detection: left goal (home defends left, away shoots left? We'll say home defends left)
+  checkGoals();
+
+  // update players
+  for(const p of PLAYERS) p.update(dt);
+}
+
+function checkGoals(){
+  // left goal is at FIELD.x- GOAL_DEPTH... but we'll detect crossing goal line within goal width
+  const goalTop = FIELD.y + (FIELD.h - GOAL_WIDTH)/2;
+  const goalBottom = goalTop + GOAL_WIDTH;
+  // left goal line x position
+  const leftLine = FIELD.x;
+  const rightLine = FIELD.x + FIELD.w;
+  // ball crosses left line between goal y
+  if(BALL.x - BALL.r <= leftLine && BALL.y >= goalTop && BALL.y <= goalBottom){
+    // away scores
+    score.away += 1; updateScore(); resetAfterGoal('away');
+  }
+  if(BALL.x + BALL.r >= rightLine && BALL.y >= goalTop && BALL.y <= goalBottom){
+    score.home += 1; updateScore(); resetAfterGoal('home');
+  }
+}
+
+function updateScore(){
+  document.getElementById('score').innerHTML = `Home ${score.home} — ${score.away} Away`;
+}
+
+function resetAfterGoal(scoringTeam){
+  // brief freeze & reset positions
+  paused = true;
+  setTimeout(()=>{
+    BALL.x = W/2; BALL.y = H/2; BALL.vx=0; BALL.vy=0; lastTouch=null;
+    setupPlayers();
+    paused = false;
+  }, 800);
+}
+
+function resetPositions(){
+  score = {home:0, away:0}; updateScore();
+  BALL.x = W/2; BALL.y = H/2; BALL.vx=0; BALL.vy=0; lastTouch=null;
+  setupPlayers();
+}
+
+// kick logic: when space pressed, if player is near ball, apply impulse toward mouse
+function handleKick(player){
+  if(player.kickCooldown>0) return;
+  const d = Math.hypot(BALL.x-player.x, BALL.y-player.y);
+  const inRange = d < player.r + BALL.r + 10; // control distance
+  // power depends on distance
+  let power = inRange? 7.6 : 2.2;
+  // aim vector: mouse relative to player
+  const tx = input.mouseX, ty = input.mouseY;
+  let dx = tx - player.x, dy = ty - player.y; const L = Math.hypot(dx,dy);
+  if(L<0.001){ dx = player.x - (FIELD.x+FIELD.w/2); dy = player.y - (FIELD.y+FIELD.h/2); }
+  const nx = dx/Math.max(1,L), ny = dy/Math.max(1,L);
+  // stronger kick if close
+  if(inRange){
+    BALL.vx += nx * power + player.vx*0.8;
+    BALL.vy += ny * power + player.vy*0.8;
+    lastTouch = {team: player.team, idx: player.idx};
+  } else {
+    // small nudge / tackle attempt
+    BALL.vx += nx * power*0.25;
+    BALL.vy += ny * power*0.25;
+  }
+  player.kickCooldown = 0.35; // seconds
+}
+
+// AI behaviour: very simple state machine
+function aiUpdate(p, dt){
+  // goalkeeper stays near goal
+  const side = p.team === 'home' ? -1 : 1; // home left => side -1
+  if(p.role === 'GK'){
+    const goalX = (p.team==='home') ? FIELD.x + 18 : FIELD.x + FIELD.w - 18;
+    const goalY = FIELD.y + FIELD.h/2;
+    // move toward ball's y but stay near goalX
+    const dy = (BALL.y - p.y) * 0.02;
+    p.vy += clamp(dy, -p.speed*6, p.speed*6) * dt*60;
+    p.vx += (goalX - p.x)*0.01 * dt*60;
+    // if ball near and in front, clear it
+    const dball = Math.hypot(BALL.x - p.x, BALL.y - p.y);
+    if(dball < 40 && p.kickCooldown<=0){
+      // kick toward center
+      const cx = FIELD.x + FIELD.w/2, cy = FIELD.y + FIELD.h/2;
+      const dx = cx - p.x, dy2 = cy - p.y; const L = Math.hypot(dx,dy2) || 1;
+      BALL.vx += dx/L * 8; BALL.vy += dy2/L * 8; p.kickCooldown = 0.6; lastTouch={team:p.team,idx:p.idx};
+    }
+    return;
+  }
+  // outfield players: simple tactic
+  // If our team near ball - chase, else move to formation spot
+  const allies = PLAYERS.filter(q => q.team===p.team && q!==p && q.role!=='GK');
+  const enemies = PLAYERS.filter(q => q.team!==p.team);
+
+  const myTeamHasBall = lastTouch && lastTouch.team === p.team;
+  const dBall = Math.hypot(BALL.x - p.x, BALL.y - p.y);
+  // if close to ball, try to take possession & kick toward goal or pass
+  if(dBall < 40){
+    // move toward ball
+    const dx = BALL.x - p.x, dy = BALL.y - p.y; const L = Math.hypot(dx,dy)||1;
+    p.vx += (dx/L) * p.speed*3 * dt*60; p.vy += (dy/L) * p.speed*3 * dt*60;
+    // attempt kick if close and cooldown
+    if(p.kickCooldown<=0){
+      // decide: shoot if in front of enemy goal, else pass to nearest team mate in attacking half
+      const isAttacker = p.role === 'ATT';
+      const goalX = p.team==='home' ? FIELD.x + FIELD.w : FIELD.x; // shoot right for home
+      const gx = p.team==='home' ? FIELD.x + FIELD.w : FIELD.x;
+      const goalY = FIELD.y + FIELD.h/2;
+      const dxg = gx - p.x; const distToGoal = Math.abs(dxg);
+      if(isAttacker && distToGoal < FIELD.w*0.45){
+        // shoot toward goal
+        const dxs = gx - p.x, dys = goalY - p.y; const Ls = Math.hypot(dxs,dys)||1;
+        BALL.vx += (dxs/Ls)*9; BALL.vy += (dys/Ls)*9; p.kickCooldown = 0.8; lastTouch={team:p.team,idx:p.idx};
+      } else {
+        // pass to best teammate (farthest forward)
+        let best = null; let bestScore = -1;
+        for(const a of allies){
+          // prefer player in better forward position
+          const sx = (p.team==='home') ? a.x : (FIELD.x+FIELD.w - a.x);
+          const scoreA = sx + Math.random()*20 - Math.hypot(a.x-p.x,a.y-p.y);
+          if(scoreA > bestScore){ best=a; bestScore=scoreA; }
+        }
+        if(best){
+          const dxp = best.x - p.x, dyp = best.y - p.y, Lp=Math.hypot(dxp,dyp)||1;
+          BALL.vx += (dxp/Lp)*7; BALL.vy += (dyp/Lp)*7; p.kickCooldown = 0.7; lastTouch={team:p.team,idx:p.idx};
+        }
+      }
+    }
+  } else {
+    // move to formation position: defenders toward own half, attackers forward
+    const formationX = (p.team==='home') ? FIELD.x + FIELD.w*0.2 + (p.idx-1)*8 : FIELD.x + FIELD.w*0.8 - (p.idx-1)*8;
+    const formationY = FIELD.y + FIELD.h*(0.2 + (p.idx/(TEAM_SIZE-1))*0.6);
+    const dx2 = formationX - p.x, dy2 = formationY - p.y; const L2 = Math.hypot(dx2,dy2)||1;
+    p.vx += (dx2/L2) * p.speed * 0.6 * dt*60; p.vy += (dy2/L2) * p.speed * 0.6 * dt*60;
+    // occasionally reposition toward ball
+    if(Math.random()<0.02){
+      p.vx += (BALL.x - p.x)*0.002 * dt*60; p.vy += (BALL.y - p.y)*0.002 * dt*60;
+    }
+  }
+}
+
+// rendering
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // field background
+  ctx.fillStyle = '#0e7f4d'; ctx.fillRect(FIELD.x, FIELD.y, FIELD.w, FIELD.h);
+  // field markings
+  ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth=2; ctx.beginPath();
+  ctx.rect(FIELD.x, FIELD.y, FIELD.w, FIELD.h);
+  ctx.stroke();
+  // center circle
+  ctx.beginPath(); ctx.arc(FIELD.x+FIELD.w/2, FIELD.y+FIELD.h/2, 48,0,Math.PI*2); ctx.stroke();
+  // halfway line
+  ctx.beginPath(); ctx.moveTo(FIELD.x+FIELD.w/2, FIELD.y); ctx.lineTo(FIELD.x+FIELD.w/2, FIELD.y+FIELD.h); ctx.stroke();
+
+  // goals
+  const goalTop = FIELD.y + (FIELD.h - GOAL_WIDTH)/2;
+  ctx.fillStyle = '#222';
+  // left goal opening
+  ctx.fillRect(FIELD.x - GOAL_DEPTH, goalTop, GOAL_DEPTH, GOAL_WIDTH);
+  // right goal
+  ctx.fillRect(FIELD.x+FIELD.w, goalTop, GOAL_DEPTH, GOAL_WIDTH);
+  // goal lines
+  ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(FIELD.x, goalTop); ctx.lineTo(FIELD.x-GOAL_DEPTH, goalTop); ctx.lineTo(FIELD.x-GOAL_DEPTH, goalTop+GOAL_WIDTH); ctx.lineTo(FIELD.x, goalTop+GOAL_WIDTH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(FIELD.x+FIELD.w, goalTop); ctx.lineTo(FIELD.x+FIELD.w+GOAL_DEPTH, goalTop); ctx.lineTo(FIELD.x+FIELD.w+GOAL_DEPTH, goalTop+GOAL_WIDTH); ctx.lineTo(FIELD.x+FIELD.w, goalTop+GOAL_WIDTH); ctx.stroke();
+
+  // draw ball shadow
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath(); ctx.ellipse(BALL.x+4, BALL.y+6, BALL.r+4, BALL.r+2, 0,0,Math.PI*2); ctx.fill();
+
+  // players
+  for(const p of PLAYERS){
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.beginPath(); ctx.ellipse(p.x+3,p.y+5,p.r+4,p.r+3,0,0,Math.PI*2); ctx.fill();
+    // body
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fillStyle = p.team==='home' ? '#1e90ff' : '#ff6b6b';
+    ctx.fill();
+    // number/role
+    ctx.fillStyle='#fff'; ctx.font='10px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(p.role, p.x, p.y);
+    // outline
+    ctx.strokeStyle='rgba(0,0,0,0.15)'; ctx.lineWidth=1; ctx.stroke();
+  }
+
+  // ball
+  ctx.beginPath(); ctx.arc(BALL.x,BALL.y,BALL.r,0,Math.PI*2);
+  ctx.fillStyle='#fff'; ctx.fill(); ctx.lineWidth=1; ctx.strokeStyle='#ccc'; ctx.stroke();
+
+  // draw aim indicator from controlled player
+  const me = findPlayerControlled();
+  if(me){
+    // draw arrow from me toward mouse
+    ctx.beginPath(); ctx.moveTo(me.x,me.y); ctx.lineTo(input.mouseX, input.mouseY); ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=2; ctx.stroke();
+    // draw small cursor
+    ctx.beginPath(); ctx.arc(input.mouseX,input.mouseY,6,0,Math.PI*2); ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.stroke();
+  }
+
+  // HUD last touch
+  ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fillRect(8,H-54,300,44);
+  ctx.fillStyle='#fff'; ctx.font='13px system-ui'; ctx.textBaseline='top';
+  ctx.fillText(`Last touch: ${lastTouch? (lastTouch.team+" #"+lastTouch.idx): 'none' }`, 14, H-48);
+
+  if(showDebug){
+    ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.font='12px monospace'; let y=14; ctx.fillText(`FPS debug on`, 12, y); y+=16; ctx.fillText(`Ball: ${BALL.x.toFixed(1)}, ${BALL.y.toFixed(1)} v:${BALL.vx.toFixed(2)},${BALL.vy.toFixed(2)}`, 12, y);
+  }
+}
+
+let lastTime = performance.now();
+function loop(t){
+  const dtRaw = (t-lastTime)/1000; lastTime = t; const dt = Math.min(dtRaw, 1/30);
+  if(!paused){ stepPhysics(dt*60); }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// small helper: resize canvas responsively
+function fitCanvas(){
+  const maxW = Math.min(window.innerWidth-40, 1200);
+  const scale = Math.min(maxW / W, (window.innerHeight-120)/H);
+  canvas.style.width = Math.round(W*scale) + 'px';
+  canvas.style.height = Math.round(H*scale) + 'px';
+}
+window.addEventListener('resize', fitCanvas); fitCanvas();
+
+// start positions
+resetPositions();
+
+</script>
+</body>
+</html>
